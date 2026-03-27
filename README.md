@@ -17,6 +17,10 @@ Over **30 open GitHub issues** document unexplained token waste, security concer
 |---|-------|-------------|
 | 1 | [Agent SDK Cache Invalidation](./reports/agent-sdk-cache-invalidation/) | Why Agent SDK V1 `query()` costs 3–10x more than CLI per message — prompt cache invalidation caused by process-per-call architecture. Fix: V2 persistent session + SDK patch. |
 | 2 | [System-Reminder Injection](./reports/system-reminder-injection/) | Complete reverse-engineering of the `<system-reminder>` injection mechanism — 15+ hidden injection types, the readFileState tracking system, 4 root-cause bugs, and why the Agent SDK triggers injection on every single turn. |
+| 3 | [Prompt Cache Architecture](./reports/prompt-cache-architecture/) | How Claude Code controls what gets cached and for how long — the single `cache_control` factory (`Ml()`), per-model disable gates, server-side 1h TTL gating via feature flag allowlist, system prompt static/dynamic zone split, message-level sliding window, and why byte-for-byte prefix matching makes injection order critical. |
+| 4 | [Tool Serialization & Cache Stability](./reports/tool-serialization-cache-stability/) | The 4-stage tool pipeline, why there is zero `.sort()` on tool arrays, how deferred tool loading silently busts the cache mid-conversation, and MCP tool description dynamism as a hidden instability source. |
+| 5 | [Context Lifecycle Management](./reports/context-lifecycle-management/) | How Claude Code decides when to compress context — 5 hardcoded threshold constants, the 10-step compaction flow, preserved message segments, the `currentDate` daily cache-kill problem, and compact chain reactions that compound cache rebuild costs. |
+| 6 | [Production Cache Optimization](./reports/production-cache-optimization/) | Concrete, tested patches and strategies for maximizing prompt cache efficiency — 3 cli.js patches (context margin, 1h TTL force, compaction threshold), cache keepalive, tool ordering stabilization, efficiency monitoring, and the postinstall patch delivery pattern. |
 
 ## Related Issues
 
@@ -39,7 +43,7 @@ Over **30 open GitHub issues** document unexplained token waste, security concer
 
 ## SDK Version Baseline
 
-Research is based on `@anthropic-ai/claude-code` v2.1.71 / Claude Code v2.1.71 (March 2026). Findings may change with future SDK updates.
+Reports #1–2 are based on `@anthropic-ai/claude-code` v2.1.71. Reports #3–6 are based on `@anthropic-ai/claude-agent-sdk` v0.2.76 (cli.js build 2026-03-14). Findings may change with future SDK updates.
 
 ## How to Cite
 
