@@ -243,6 +243,27 @@ await session.query("list the available mcp tools", { maxTurns: 1 });
 
 ---
 
+## Skill 呢？一個常見的誤解
+
+一個自然的問題：如果 MCP 工具載入會破壞快取，那載入一個 Skill（斜線指令）是否會造成同樣的問題？
+
+不會。兩者的機制完全不同。
+
+當一個 Skill 被調用時，Claude Code 做兩件事：Skill tool 將 skill 內容作為普通的 `tool_result` 回傳到當前輪次的位置，同時建立一個 `invoked_skills` attachment 記錄已載入的 skill（用於 session resume 時恢復）。這兩者都是**追加到 messages 陣列的尾部** — Skill 內容在對話的當前位置進入，不會被回溯插入到 prefix 的較前面位置。
+
+驅動延遲工具載入機制的 discovery scanner（source 中的 `zF`）只搜尋 `tool_reference` blocks — 這是一種只有 ToolSearch 工具才會產生的特殊 block 類型。Skill 調用不會產生 `tool_reference` blocks。`tools` 陣列完全不受 Skill 載入影響。
+
+| | MCP 工具（透過 ToolSearch） | Skill（透過 Skill tool） |
+|---|---|---|
+| 改變了什麼 | `tools` 陣列（prefix 前段） | Messages 陣列（追加到當前輪次） |
+| 對先前輪次的快取影響 | **全部失效** — tools prefix 偏移，之後的所有內容都 miss | **無** — 新內容在尾部，先前的 prefix 不變 |
+| 機制 | `tool_reference` block → discovery scanner → tools 陣列重建 | `tool_result` + `invoked_skills` attachment → messages 追加 |
+| 首次使用的成本 | 完整快取重建（整個對話的 125%） | 接近零（只有新增內容是 cache write） |
+
+如果你在選擇將功能實作為 MCP 工具還是 Skill，而快取效率是考量因素，這個區別值得注意。Skill 對快取是中性的；MCP 工具在每個對話中每個首次使用的工具都會帶來一次性的快取重建代價。
+
+---
+
 ## 參考資料
 
 - [逆向工程 Claude Agent SDK：每條訊息消耗 2-3% Credit 的根本原因與修復](../agent-sdk-cache-invalidation/README.md) — 涵蓋 prompt cache 的運作方式以及快取 miss 的代價

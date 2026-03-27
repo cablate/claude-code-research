@@ -243,6 +243,27 @@ The gap between these two scenarios is the cost of MCP tool integration that no 
 
 ---
 
+## What About Skills? A Common Misconception
+
+A natural question: if MCP tool loading busts the cache, does loading a Skill (slash command) cause the same problem?
+
+No. The mechanisms are entirely different.
+
+When a Skill is invoked, Claude Code does two things: the Skill tool returns the skill content as a normal `tool_result` at the current turn position, and an `invoked_skills` attachment is created to record the loaded skill for session resume. Both of these are **appended to the end of the messages array** — the Skill content enters the conversation at the current turn position, not retroactively inserted into an earlier part of the prefix.
+
+The discovery scanner (`zF` in source) that drives the deferred tool loading mechanism looks exclusively for `tool_reference` blocks — a special block type produced only by the ToolSearch tool. Skill invocations do not produce `tool_reference` blocks. The `tools` array is completely unaffected by Skill loading.
+
+| | MCP Tool (via ToolSearch) | Skill (via Skill tool) |
+|---|---|---|
+| What changes | `tools` array (early in the prefix) | Messages array (appended at current turn) |
+| Cache impact on prior turns | **Full invalidation** — tools prefix shift breaks everything after | **None** — new content is at the end, prior prefix is unchanged |
+| Mechanism | `tool_reference` block → discovery scanner → tools array rebuild | `tool_result` + `invoked_skills` attachment → messages append |
+| Cost per first use | Full cache rebuild (125% of entire conversation) | Near zero (only the new content is a cache write) |
+
+If you are choosing between implementing functionality as an MCP tool or as a Skill, and cache efficiency matters, this distinction is worth considering. Skills are cache-neutral; MCP tools carry a one-time cache rebuild penalty per unique tool per conversation.
+
+---
+
 ## References
 
 - [Reverse-Engineering the Claude Agent SDK: Root Cause and Fix for the 2-3% Credit Burn Per Message](../agent-sdk-cache-invalidation/README.md) — covers how the prompt cache works and why cache misses are expensive
