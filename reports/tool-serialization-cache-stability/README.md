@@ -93,17 +93,46 @@ When Claude decides it needs a deferred tool, a search step runs that loads the 
 
 **The first invocation of any MCP tool in a conversation is a guaranteed cache miss.** The `tools` array before the call is structurally different from the `tools` array after. The cache prefix has changed. There is no way around this.
 
+### How It Works Internally: The Discovery Scanner
+
+We traced this to the exact mechanism. On every turn, the main query function (`mGq` in source) rebuilds the `tools` array from scratch. The decision of which deferred tools to include is driven by a discovery scanner (`zF` in source) that scans the full message history for previously loaded tools:
+
+```javascript
+// Simplified from mGq — the main query generator
+// Runs on EVERY turn, not just the first
+
+let discoveredTools = scanMessageHistory(messages);  // zF(A)
+let J;
+if (dynamicToolLoading) {
+  J = allTools.filter(tool => {
+    if (!isDeferred(tool)) return true;      // built-ins: always include
+    if (isToolSearch(tool)) return true;      // tool-search itself: always
+    return discoveredTools.has(tool.name);    // MCP tools: ONLY if discovered
+  });
+}
+```
+
+This means the `tools` array is not a fixed list — it grows over the course of a conversation. Each time Claude uses tool-search to load a deferred MCP tool, that tool's name enters the message history. On the next turn, the scanner finds it, and the filter includes it. The serialized `tools` array gains one more entry.
+
+**The cost compounds with conversation length.** Each cache miss forces a full cache rebuild covering the system prompt, all tool definitions, and the entire message history up to that point. A tool loaded on turn 10 causes a miss that rewrites far more tokens than one loaded on turn 2.
+
 Here's what a multi-turn session looks like:
 
-| Turn | What Happens | tools Array | Cache |
-|------|-------------|-------------|-------|
-| 1 | No MCP tools used | Deferred names only | Hit (if prefix stable) |
-| 2 | First use of `mcp__files__read` | +1 full schema added | **Miss** |
-| 3 | `mcp__files__read` again | Same as turn 2 | Hit |
-| 4 | First use of `mcp__search__query` | +1 more schema added | **Miss** |
-| 5+ | Same tools repeated | Stable | Hit |
+| Turn | What Happens | tools Array | Cache | Rebuild Size |
+|------|-------------|-------------|-------|-------------|
+| 1 | No MCP tools used | Built-ins only | Hit | — |
+| 2 | Claude uses tool-search to load `mcp__files__read` | Same as turn 1 (tool-search result is a message, not a tool entry) | Hit | — |
+| 3 | Claude calls `mcp__files__read` | Discovery scanner finds it in history → +1 full schema in array | **Miss** | ~20k tokens |
+| 4 | `mcp__files__read` again | Same as turn 3 | Hit | — |
+| 5 | Claude loads `mcp__search__query` via tool-search | Same as turn 3 | Hit | — |
+| 6 | Claude calls `mcp__search__query` | Scanner finds it → +1 more schema | **Miss** | ~40k tokens |
+| 7 | Claude loads `mcp__browser__click` via tool-search | Same as turn 6 | Hit | — |
+| 8 | Claude calls `mcp__browser__click` | Scanner finds it → +1 more schema | **Miss** | ~60k tokens |
+| 9+ | Same tools repeated | Stable | Hit | — |
 
-Each unique MCP tool invoked for the first time costs one guaranteed cache miss. The more distinct MCP tools a session uses, the more misses accumulate before the tools array stabilizes.
+Each unique MCP tool invoked for the first time costs one guaranteed cache miss. The misses do not happen when the tool is loaded via tool-search — they happen on the **next turn**, when the discovery scanner rebuilds the tools array and includes the newly discovered tool.
+
+**The cost compounds.** The cache miss on turn 8 rebuilds ~60k tokens (all prior messages), while the miss on turn 3 rebuilds only ~20k. Using three MCP tools across eight turns costs roughly three times more than a single close-and-resume would.
 
 There is also a feature flag (`tengu_defer_all` in source) that extends deferral to all tools including built-ins. When active, the initial tools array is nearly empty and every tool use triggers a deferred load. This appears to be used in specific internal scenarios.
 
@@ -199,9 +228,10 @@ Log the serialized tools array for the first few turns of a session. If new entr
 For a system with 3 MCP servers and 4-6 tools each:
 
 - Session starts with 15-18 deferred tools
-- Each unique MCP tool invoked for the first time triggers a guaranteed cache miss
+- Each unique MCP tool invoked for the first time triggers a guaranteed cache miss **on the following turn**
 - The tools array does not stabilize until all needed tools have been used at least once
-- If your average session is 10 turns and you use 15 MCP tools, the session may spend its entire duration in a cache-miss state
+- The cost of each miss scales with conversation length — later misses are more expensive than earlier ones
+- If your average session is 10 turns and you use 5 distinct MCP tools across those turns, each miss rebuilds an increasingly large context. At Opus 4 rates ($37.50/M for cache writes), 5 sequential misses across a growing conversation can cost more than 5 separate close-and-resume cycles
 
 For a system with built-in tools only:
 
