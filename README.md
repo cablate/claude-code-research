@@ -1,8 +1,15 @@
 # Claude Code Research
 
+[![License: CC BY 4.0](https://img.shields.io/badge/License-CC_BY_4.0-lightgrey.svg)](https://creativecommons.org/licenses/by/4.0/)
+[![Contributions Welcome](https://img.shields.io/badge/contributions-welcome-brightgreen.svg)](./CONTRIBUTING.md)
+
 Independent research on Claude Code internals, Claude Agent SDK, and related tooling. All findings are based on reverse engineering the publicly distributed npm packages.
 
 Each report includes both English and Chinese versions.
+
+## Why This Exists
+
+Over **30 open GitHub issues** document unexplained token waste, security concerns, and architectural problems in Claude Code — many with dozens of comments and no official response. This repository provides the technical root-cause analysis that the community has been asking for, along with working solutions.
 
 ## Reports
 
@@ -34,6 +41,23 @@ Each report includes both English and Chinese versions.
 
 Research is based on `@anthropic-ai/claude-code` v2.1.71 / Claude Code v2.1.71 (March 2026). Findings may change with future SDK updates.
 
+## How to Cite
+
+If you reference this research in blog posts, articles, or other projects:
+
+```
+CabLate, "Claude Code Research," GitHub, 2026.
+https://github.com/cablate/claude-code-research
+```
+
+## Contributing
+
+We welcome new research findings, corrections, and updates. See [CONTRIBUTING.md](./CONTRIBUTING.md) for submission guidelines, quality standards, and the report structure template.
+
+## Disclaimer
+
+This is independent research. It is **not affiliated with, endorsed by, or sponsored by Anthropic**. All analysis is performed on publicly distributed npm packages. No proprietary source code is reproduced.
+
 ## License
 
-CC-BY-4.0
+[CC-BY-4.0](./LICENSE) — You are free to share and adapt this material with appropriate attribution.
