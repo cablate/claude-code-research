@@ -1,278 +1,221 @@
 # Tool Serialization and Cache Stability — Why Your MCP Tools Might Be Silently Busting the Prompt Cache
 
-You add an MCP server to Claude Code. Suddenly your cache efficiency drops. You add a second MCP server and it gets worse. Neither the SDK docs nor the Claude Code changelog mention anything about tool ordering and prompt caching. There is no warning.
+The `tools` array is part of every API request's cache prefix. If the serialized tools change between turns — even by a single byte — the Anthropic API treats the entire prefix as new and rewrites the cache at 125% cost. The system prompt, the messages, everything after the divergence point: all invalidated.
 
-This report documents how Claude Code's tool pipeline works internally, why MCP tool loading is non-deterministic by design, and which of those behaviors silently invalidate the prompt cache mid-conversation.
+Claude Code never sorts its tools. Stability depends entirely on insertion consistency. And the deferred tool loading mechanism silently changes the tools array mid-conversation, guaranteeing cache misses in ways that are invisible to the developer.
 
-The analysis is based on reverse-engineering `cli.js` build `2026-03-14`, bundled in `@anthropic-ai/claude-agent-sdk` v0.2.76.
+This report traces the full pipeline from tool list construction to API serialization, identifies every point where instability can enter, and explains what SDK users can do about it.
 
----
-
-## Methodology
-
-`cli.js` is a 12MB minified JavaScript file. Variable names are obfuscated on each build. The approach is to anchor on string constants that do not change between builds.
-
-For this investigation the relevant anchors were:
-
-- `"isMcp"` — locates MCP tool filtering and deferred loading logic
-- `"available-deferred-tools"` — locates the system prompt block for deferred tools
-- `"input_schema"` — locates `Sh1()`, the tool serialization function
-- `"tengu_defer_all"` — locates the feature flag controlling full tool deferral
-- `"disallowedTools"` — locates `_c()`, the tool filtering function
-- `"K0"` (deduplication key) — locates `u66()`, the merge step
-
-From each anchor, the surrounding function and its call graph were traced. The 4-stage pipeline was reconstructed by following the data flow from initial tool list construction through to the final API payload.
+Analysis based on reverse-engineering `cli.js` build `2026-03-14`, bundled in `@anthropic-ai/claude-agent-sdk` v0.2.76.
 
 ---
 
-## The 4-Stage Tool Pipeline
+## How the Tool List Gets Built
 
-Every API request Claude Code sends goes through four discrete stages to build the `tools` array.
+Every API request that Claude Code sends assembles its `tools` array through four stages. Understanding these stages is necessary to understand where cache instability enters.
 
-### Stage 1: `ng()` — Built-in Tool Registry
+### Stage 1: The Built-in Registry
 
-`ng()` returns a hardcoded literal array containing every built-in tool (Read, Write, Edit, Bash, Grep, Glob, WebFetch, TodoWrite, etc.). The order of entries in this array is determined at bundle compile time and does not change between runs.
+The first stage is a hardcoded literal array containing every built-in tool — Read, Write, Edit, Bash, Grep, Glob, WebFetch, TodoWrite, and others. This array is determined at bundle compile time. The tool list builder function (`ng` in source) returns this same array on every call, in the same order. This is the only stage that is deterministic by construction.
 
-This is the only stage that is fully deterministic by construction.
+### Stage 2: Allowed/Denied Filtering
 
-### Stage 2: `FX()` — allowedTools / denyRules Filter
+The second stage takes the built-in array and applies JavaScript's `.filter()` using the `allowedTools` and `denyRules` configuration (`FX` in source). Because `.filter()` preserves insertion order, the relative ordering of surviving entries is identical to Stage 1.
 
-`FX()` takes the built-in array and applies `.filter()` using the `allowedTools` and `denyRules` configuration. Because `.filter()` preserves insertion order, the relative order of surviving entries is identical to Stage 1.
+One subtlety: if you pass `allowedTools: ["Bash", "Read", "Write"]`, the resulting list has those tools in their Stage 1 order (Bash before Read before Write based on compile-time position), not in the order you specified. The `allowedTools` array is a membership test, not an ordering instruction.
 
-If you pass `allowedTools: ["Bash", "Read", "Write"]`, the resulting list will have those tools in their Stage 1 order, not in the order you specified. The `allowedTools` array is used as a membership test, not as an ordering instruction.
+### Stage 3: Merging Built-ins with MCP Tools
 
-### Stage 3: `u66()` — Built-in + MCP Merge
-
-`u66()` produces the final tool list by concatenating built-ins and MCP tools:
+The merge step (`u66` in source) concatenates built-ins and MCP tools:
 
 ```javascript
+// Built-in tools always come first, MCP tools appended after
 [...builtins, ...mcpTools]
 ```
 
-It then deduplicates by name using a key function `K0` (a Map-based dedup that keeps first occurrence). The result: built-ins always precede MCP tools, and if an MCP tool has the same name as a built-in, the built-in wins.
+It then deduplicates by name, keeping the first occurrence. Built-ins always precede MCP tools. If an MCP tool shares a name with a built-in, the built-in wins.
 
-### Stage 4: `mGq()` → `Sh1()` — Serialization
+### Stage 4: Serialization to Wire Format
 
-`Sh1()` converts each tool to the API wire format:
+The serializer (`Sh1` in source) converts each tool into the shape the API expects:
 
 ```javascript
 {
   name: tool.name,
-  description: await A.prompt(),   // ASYNC
-  input_schema: tool.inputJSONSchema ?? fU(tool.inputSchema)
+  description: await tool.prompt(),  // async — this matters
+  input_schema: tool.jsonSchema ?? deriveFromZod(tool.inputSchema)
 }
 ```
 
-Two details matter here:
+Two details matter for cache stability:
 
-**`description` is async.** Built-in tools return static strings synchronously. MCP tools may call the server for a dynamic description. Any non-determinism in the server response propagates directly into the serialized payload.
+**Descriptions are resolved asynchronously.** Built-in tools return static strings — always the same content. MCP tools may call the server for a dynamic description. Any non-determinism in the server response propagates directly into the serialized payload.
 
-**Schema source differs by tool type.** MCP tools use `inputJSONSchema` (the schema as provided by the MCP server). Built-in tools derive their schema from Zod definitions via `fU()`, which is memoized by WeakMap — so built-in schemas are stable within a process.
+**Schema sources differ by tool type.** MCP tools use the JSON schema provided by the MCP server at registration. Built-in tools derive their schemas from Zod definitions via a memoized converter — stable within a process lifetime.
 
-`cache_control` is not applied at the individual tool level in the main query path. Tools are not individually cached; only the assembled system prompt gets cache markers.
-
----
-
-## The Critical Finding: No `.sort()` Anywhere in the Tool Path
-
-The entire `cli.js` source was searched for `.sort()` calls in proximity to tool-related code. Every `.sort()` call found belongs to one of these categories:
-
-- Worktree path sorting
-- Insights data sorting
-- Help menu display
-- Compact metadata output
-
-There is no `.sort()` in `ng()`, `FX()`, `u66()`, `mGq()`, or `Sh1()`.
-
-**Tool order is strictly insertion-order throughout all four stages.** This has a concrete consequence: if the insertion order of MCP tools varies between two runs, the serialized `tools` array is different, and the prompt cache misses.
+The `cache_control` marker is not applied at the individual tool level. Tools are not individually cached; only the assembled system prompt gets cache markers.
 
 ---
 
-## MCP Tool Ordering: Stable in Theory, Fragile in Practice
+## The Critical Finding: No Sorting Anywhere
 
-MCP tools enter the pipeline via `Fr6()`, which loads tools from all registered MCP servers using concurrent server initialization (`ZL1`). The loading is concurrent — server responses arrive in non-deterministic order.
+I searched the entire `cli.js` source for `.sort()` calls near tool-related code. Every `.sort()` found belongs to unrelated functionality — worktree path sorting, insights data, help menu display, compact metadata output.
 
-The tool list stored in the session is built from the client registration order at startup. Config file order determines registration order. For a stable config file read from disk, registration order is consistent across restarts. For programmatically constructed configs (e.g., injected via SDK options), insertion order depends on the caller.
+The tool pipeline has no `.sort()` at any stage. Tool order is strictly insertion-order from start to finish.
 
-In practice, MCP tool order is usually stable. The fragility appears in two scenarios:
-
-1. **Programmatic config construction** where tool order is not explicitly controlled (e.g., iterating over an object whose key order is not guaranteed).
-2. **MCP server reconnect events**, where a server goes down and comes back. On reconnect, the tool list is re-registered, potentially at a different position in the merged array.
-
-Both scenarios produce a structurally different `tools` array. The Anthropic API treats the entire `tools` block as part of the cache prefix. A different array = a different prefix = a full cache miss.
+This means the cache prefix depends on something no one is explicitly controlling. For built-in tools it works out fine — the compile-time array is the same every run. For MCP tools, it means the order depends on how and when tools are registered, and that is where things get fragile.
 
 ---
 
-## Deferred Tool Loading: The Mid-Conversation Cache Breaker
+## MCP Tool Ordering: Usually Stable, Occasionally Not
 
-This is the most impactful finding.
+MCP tools enter the pipeline through a loader (`Fr6` in source) that initializes all registered MCP servers concurrently. The responses arrive in non-deterministic order — but the tool list stored in the session is built from the client registration order at startup, not from response arrival order. So for a config file read from disk, registration order is consistent across restarts.
 
-`GX()` implements deferred tool loading. The rule is simple: every tool where `isMcp === true` is deferred by default.
+The fragility appears in two scenarios:
 
-What "deferred" means in practice:
+**Programmatic config construction.** If your code builds the `mcpServers` object by iterating over a data structure whose key order isn't guaranteed, the registration order varies between runs. Two requests with nominally identical config but different key insertion order produce different MCP tool arrays.
 
-- The tool's full schema is **not** sent in the initial API request
-- Instead, only the tool's name is listed in a `<available-deferred-tools>` block inside the system prompt
-- The system prompt looks like: `<available-deferred-tools>mcp__server__toolname, ...</available-deferred-tools>`
+**MCP server reconnection.** If a server goes down and comes back, the tool list is re-registered, potentially at a different position in the merged array.
 
-When Claude determines it needs a deferred tool, a tool-search step runs that loads the full schema. At this point the `tools` array gains a new entry with the full `{name, description, input_schema}` object.
-
-**This means the first invocation of any MCP tool in a conversation is a guaranteed cache miss for that turn.** The `tools` array before the call differs structurally from the `tools` array after the call. The cache prefix has changed.
-
-In a multi-turn session:
-
-| Turn | MCP Tool Used | tools array state | Cache result |
-|------|---------------|-------------------|--------------|
-| 1 | none | deferred only | hit (if stable) |
-| 2 | `mcp__files__read` (first use) | +1 full schema entry added | **miss** |
-| 3 | `mcp__files__read` (cached) | same as turn 2 | hit |
-| 4 | `mcp__search__query` (first use) | +1 more full schema entry added | **miss** |
-| 5+ | same tools | stable | hit |
-
-Each unique MCP tool invoked for the first time in a session costs one cache miss. The more distinct MCP tools you use, the more guaranteed misses you accumulate before the session reaches a stable tool array.
-
-A feature flag `tengu_defer_all` extends deferral to all tools, including built-ins. When active, the initial tools array is nearly empty and every tool use triggers a deferred load. This flag appears to be used in specific internal scenarios.
+Both scenarios produce a structurally different `tools` array. The Anthropic API treats the entire `tools` block as part of the cache prefix. Different array = different prefix = full cache miss.
 
 ---
 
-## `disallowedTools` Filtering: `_c()` Preserves Order
+## Deferred Tool Loading: The Hidden Cache Breaker
 
-`_c()` materializes the `disallowedTools` setting into a Set, then applies `.filter()` to remove matching entries. Order is preserved. The filtering is applied at the agent or subagent level, sourced from the agent definition frontmatter.
+This is the most impactful finding in the report.
+
+Claude Code defers all MCP tools by default. The deferred loading controller (`GX` in source) applies a simple rule: every tool where `isMcp === true` is deferred. Here's what that means in practice:
+
+When a session starts, MCP tools are not included in the `tools` array at all. Instead, only their names are listed in a text block inside the system prompt: `<available-deferred-tools>mcp__server__toolname, ...</available-deferred-tools>`. The model sees the names and knows it can request them, but the full schemas are absent from the request.
+
+When Claude decides it needs a deferred tool, a search step runs that loads the full schema. At that point, the `tools` array gains a new entry with the complete `{name, description, input_schema}` object.
+
+**The first invocation of any MCP tool in a conversation is a guaranteed cache miss.** The `tools` array before the call is structurally different from the `tools` array after. The cache prefix has changed. There is no way around this.
+
+Here's what a multi-turn session looks like:
+
+| Turn | What Happens | tools Array | Cache |
+|------|-------------|-------------|-------|
+| 1 | No MCP tools used | Deferred names only | Hit (if prefix stable) |
+| 2 | First use of `mcp__files__read` | +1 full schema added | **Miss** |
+| 3 | `mcp__files__read` again | Same as turn 2 | Hit |
+| 4 | First use of `mcp__search__query` | +1 more schema added | **Miss** |
+| 5+ | Same tools repeated | Stable | Hit |
+
+Each unique MCP tool invoked for the first time costs one guaranteed cache miss. The more distinct MCP tools a session uses, the more misses accumulate before the tools array stabilizes.
+
+There is also a feature flag (`tengu_defer_all` in source) that extends deferral to all tools including built-ins. When active, the initial tools array is nearly empty and every tool use triggers a deferred load. This appears to be used in specific internal scenarios.
+
+---
+
+## Tool Descriptions: Safe for Built-ins, Risky for MCP
+
+The serializer resolves each tool's description by calling an async method. For built-in tools, this returns a static string — hardcoded in the bundle, identical every time. Built-in descriptions are cache-safe.
+
+For MCP tools, the description comes from the MCP server. If the server generates descriptions dynamically — including a timestamp, a record count, an environment variable, anything that varies between calls — the serialized description changes between turns. Even a single character difference in any tool description invalidates the entire `tools` block in the cache prefix.
+
+This is especially insidious because the tool might function identically. The search results are the same, the behavior is the same, but the description says "Search across 1,847 documents" instead of "Search across 1,846 documents" and the entire cache is gone.
+
+---
+
+## disallowedTools and allowedTools: Order-Preserving Filters
+
+The disallowed tools filter (`_c` in source) materializes the `disallowedTools` setting into a Set, then applies `.filter()` to remove matching entries. Order is preserved. The filtering is applied at the agent or subagent level, sourced from the agent definition frontmatter.
 
 From the SDK side, `disallowedTools` are passed as `--disallowedTools ToolA,ToolB` CLI arguments. No sorting is applied at this stage either.
 
----
-
-## Complete Cache Impact Analysis
-
-Ranked by likelihood and severity:
-
-### High impact: Deferred tool loading (first MCP use per session)
-
-Guaranteed cache miss on the turn a new MCP tool is first loaded. Affects every session that uses MCP tools. The miss is structural — the `tools` array is literally different before and after the deferred load.
-
-### High impact: Dynamic MCP tool descriptions
-
-If an MCP server's tool description is generated dynamically (e.g., includes a timestamp, a database record count, or any runtime state), the serialized description changes between turns. Even a single character difference in any tool description invalidates the entire `tools` block.
-
-The `description` field in `Sh1()` comes from `await A.prompt()`. For MCP tools, this resolves from the server. If the server returns anything that varies, the cache breaks.
-
-### Medium impact: MCP server config ordering
-
-If `mcpServers` is passed as a JavaScript object (common in SDK usage), the key iteration order depends on insertion order, which is not guaranteed to be consistent across all environments and versions. Two requests with nominally identical config but different key insertion order produce different MCP tool arrays.
-
-### Medium impact: `extraToolSchemas` variance
-
-Some features inject additional tool schemas into the array only when active. Web search is one example: its schema is present in the tools array only when the web search feature is enabled for that turn. Toggling the feature mid-conversation changes the tools array structure.
-
-### Low impact: `isEnabled()` state changes
-
-Each tool has an `isEnabled()` predicate. MCP tools can become disabled if the MCP server connection drops. A reconnect that changes which tools are `isEnabled()` changes the filtered tool list. Rare in stable setups, but worth noting.
-
-### No impact: Built-in tool descriptions
-
-Built-in tools return static strings from `A.prompt()`. These strings are not async in practice and do not vary between runs. Built-in tool descriptions are safe from a cache perspective.
-
-### No impact: Built-in tool schemas
-
-Built-in schemas are derived from Zod definitions via `fU()`, memoized by WeakMap within the process lifetime. They do not change between turns and are safe.
+Neither `allowedTools` nor `disallowedTools` introduces ordering instability on their own — they preserve whatever order existed before filtering. The risk is only if the input to these filters is itself unstable.
 
 ---
 
-## Mitigation Strategies
+## What SDK Users Can Do
 
-### 1. Sort `allowedTools` before passing to the SDK
+### Sort `allowedTools` before passing to the SDK
 
 ```javascript
-// Before (unstable — depends on object insertion order)
-const options = {
-  allowedTools: getEnabledTools()
-};
+// Unstable — depends on however getEnabledTools() builds the list
+const options = { allowedTools: getEnabledTools() };
 
-// After (stable — alphabetical order)
-const options = {
-  allowedTools: getEnabledTools().sort()
-};
+// Stable — alphabetical order, always the same
+const options = { allowedTools: getEnabledTools().sort() };
 ```
 
 One line. Eliminates one source of ordering instability.
 
-### 2. Sort `mcpServers` keys for stable serialization
+### Sort `mcpServers` keys
 
 ```javascript
-// Before
-const mcpServers = buildMcpConfig();
-
-// After
+// Ensures consistent key order regardless of how the config was built
 const mcpServers = Object.fromEntries(
   Object.entries(buildMcpConfig()).sort(([a], [b]) => a.localeCompare(b))
 );
 ```
 
-Ensures that programmatically constructed MCP configs produce a consistent key order regardless of insertion order.
+### Make MCP tool descriptions completely static
 
-### 3. Make MCP tool descriptions completely static
-
-If you control the MCP server, ensure its tool descriptions are hardcoded constants. No timestamps, no database lookups, no environment-dependent content in the `description` field.
+If you control the MCP server, hardcode the descriptions. No timestamps, no database lookups, no runtime state.
 
 ```python
-# Bad: dynamic description
+# Dynamic description — cache breaker
 @mcp.tool()
 def search(query: str) -> str:
     """Search across {len(self.documents)} documents."""
     ...
 
-# Good: static description
+# Static description — cache safe
 @mcp.tool()
 def search(query: str) -> str:
     """Search across the document index."""
     ...
 ```
 
-### 4. Pre-warm MCP tools at session start
+### Pre-warm MCP tools at session start
 
-If you know which MCP tools a session will use, trigger them early to force deferred loading before cache-sensitive turns. A no-op call to each tool at session initialization incurs the guaranteed miss upfront rather than mid-conversation.
+If you know which MCP tools a session will use, trigger them early. A throwaway prompt at session initialization forces deferred loading before cache-sensitive turns begin:
 
 ```javascript
-// Session initialization
+// Force all MCP tools to load upfront
 await session.query("list the available mcp tools", { maxTurns: 1 });
-// Now all MCP tools are loaded; subsequent turns can cache
+// Subsequent turns benefit from a stable tools array
 ```
 
-### 5. Consider disabling deferred loading for cache-critical sessions
+This shifts the guaranteed cache misses to the beginning of the session rather than scattering them across productive turns.
 
-If your session uses a known, fixed set of MCP tools, disabling deferral means all schemas are serialized upfront. No mid-conversation cache busting from new tool loads. This is a tradeoff: larger initial request, but stable `tools` array from turn 1.
+### Consider disabling deferred loading entirely
 
-This requires patching or a flag — there is no current public API option to disable deferred loading directly.
+If your session uses a known, fixed set of MCP tools, disabling deferral means all schemas are serialized upfront. Larger initial request, but stable `tools` array from turn 1. No mid-conversation surprises.
 
-### 6. Monitor the tools array across turns
+There is no public API option for this — it requires patching or a feature flag.
 
-Add logging to capture the serialized tools array for the first few turns of a session. If you see new entries appearing in turns 2, 3, 4, those are deferred loads causing cache misses. Quantify the pattern before deciding on mitigation.
+### Monitor the tools array across turns
+
+Log the serialized tools array for the first few turns of a session. If new entries appear in turns 2, 3, 4, those are deferred loads causing cache misses. Quantify the pattern before deciding on mitigation.
 
 ---
 
-## Impact on Real Systems
+## The Real-World Cost
 
-For a system using 3 MCP servers with 4–6 tools each:
+For a system with 3 MCP servers and 4-6 tools each:
 
-- **Baseline**: 15–18 deferred tools at session start
-- **First 15–18 turns**: at least one guaranteed miss per unique MCP tool invoked
-- **After all tools loaded**: `tools` array stabilizes, cache can accumulate
+- Session starts with 15-18 deferred tools
+- Each unique MCP tool invoked for the first time triggers a guaranteed cache miss
+- The tools array does not stabilize until all needed tools have been used at least once
+- If your average session is 10 turns and you use 15 MCP tools, the session may spend its entire duration in a cache-miss state
 
-If your average session is 10 turns and you have 15 MCP tools, every session potentially stays in a cache-miss state for its entire duration.
+For a system with built-in tools only:
 
-For a system with no MCP tools (built-ins only):
-
-- Stage 1 output is compile-time stable
-- Stage 2 output is stable if `allowedTools` is sorted or omitted
-- No deferred loading
+- The tool list is compile-time stable
+- No deferred loading occurs
 - Cache stability is essentially guaranteed from turn 1
+
+The gap between these two scenarios is the cost of MCP tool integration that no one talks about.
 
 ---
 
 ## References
 
-- [Reverse-Engineering the Claude Agent SDK: Root Cause and Fix for the 2–3% Credit Burn Per Message](../agent-sdk-cache-invalidation/README.md) — prerequisite reading; covers how the prompt cache works and why cache misses are expensive
+- [Reverse-Engineering the Claude Agent SDK: Root Cause and Fix for the 2-3% Credit Burn Per Message](../agent-sdk-cache-invalidation/README.md) — covers how the prompt cache works and why cache misses are expensive
 - SDK version: `@anthropic-ai/claude-agent-sdk` v0.2.76, `cli.js` build `2026-03-14`
-- Anthropic API prompt caching: cache reads at 10% of base input cost; cache writes at 125% of base input cost
-- [Model Context Protocol specification](https://modelcontextprotocol.io) — MCP tool schema format referenced in `Sh1()`
+- Anthropic API prompt caching: cache reads at 10% of base input cost, cache writes at 125%
+- [Model Context Protocol specification](https://modelcontextprotocol.io)

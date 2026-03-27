@@ -1,278 +1,221 @@
 # 工具序列化與快取穩定性 — 為什麼你的 MCP 工具可能正在悄悄破壞 Prompt Cache
 
-你在 Claude Code 加入一個 MCP server。快取效率突然下降。再加第二個，情況更糟。SDK 文件和 Claude Code 的 changelog 都沒有提到工具排序與 prompt caching 之間的關係。沒有任何警告。
+`tools` 陣列是每個 API 請求快取前綴的一部分。如果序列化後的工具在對話輪次之間有任何改變 — 哪怕一個 byte — Anthropic API 就會把整個前綴視為全新的，以 125% 的費率重新寫入快取。System prompt、messages、分歧點之後的所有內容：全部失效。
 
-這份報告記錄了 Claude Code 內部工具 pipeline 的運作方式、MCP 工具載入為什麼在設計上是非確定性的，以及這些行為中哪些會在對話中途悄悄讓 prompt cache 失效。
+Claude Code 從不排序它的工具。穩定性完全取決於插入一致性。而延遲工具載入機制會在對話中途悄悄改變 tools 陣列，以開發者完全看不見的方式保證快取 miss。
+
+這份報告追蹤了從工具列表建構到 API 序列化的完整 pipeline，找出每一個不穩定性可能進入的環節，並說明 SDK 使用者能做些什麼。
 
 分析基於逆向工程 `cli.js` build `2026-03-14`，打包於 `@anthropic-ai/claude-agent-sdk` v0.2.76。
 
 ---
 
-## 方法論
+## 工具列表如何被建構
 
-`cli.js` 是一個 12MB 的壓縮 JavaScript 檔案。每次 build 都會重新混淆變數名稱。方法是透過不隨 build 改變的字串常數來定錨。
+Claude Code 發出的每個 API 請求，都要經過四個階段來組裝 `tools` 陣列。理解這些階段，才能理解快取不穩定性從哪裡進入。
 
-本次調查使用的錨點：
+### 第一階段：內建工具登錄表
 
-- `"isMcp"` — 定位 MCP 工具過濾與延遲載入邏輯
-- `"available-deferred-tools"` — 定位延遲工具在 system prompt 中的區塊
-- `"input_schema"` — 定位 `Sh1()`，工具序列化函數
-- `"tengu_defer_all"` — 定位控制全工具延遲的 feature flag
-- `"disallowedTools"` — 定位 `_c()`，工具過濾函數
-- `"K0"`（去重 key）— 定位 `u66()`，合併步驟
+第一階段是一個硬編碼的字面陣列，包含所有內建工具 — Read、Write、Edit、Bash、Grep、Glob、WebFetch、TodoWrite 等。這個陣列在 bundle 編譯時就已決定。工具列表建構函數（source 中為 `ng`）每次呼叫都回傳同一個陣列、同一個順序。這是整個 pipeline 中唯一從構造上就完全確定性的階段。
 
-從每個錨點出發，追蹤周圍函數及其調用圖。透過跟隨資料流從初始工具列表建構到最終 API payload，重建了這個 4 階段 pipeline。
+### 第二階段：允許 / 拒絕過濾
 
----
+第二階段取得內建陣列後，使用 `allowedTools` 和 `denyRules` 設定執行 JavaScript 的 `.filter()`（source 中為 `FX`）。因為 `.filter()` 保留插入順序，存活下來的條目相對排序與第一階段完全相同。
 
-## 4 階段工具 Pipeline
+一個細節：如果你傳入 `allowedTools: ["Bash", "Read", "Write"]`，結果列表會按照這些工具在第一階段的順序排列（Bash 在 Read 前面，Read 在 Write 前面，依據編譯時位置），而不是你指定的順序。`allowedTools` 陣列是成員檢測，不是排序指令。
 
-Claude Code 發出的每個 API 請求，都要經過四個獨立階段來建構 `tools` 陣列。
+### 第三階段：合併內建與 MCP 工具
 
-### 第一階段：`ng()` — 內建工具登錄表
-
-`ng()` 回傳一個硬編碼的字面陣列，包含所有內建工具（Read、Write、Edit、Bash、Grep、Glob、WebFetch、TodoWrite 等）。這個陣列中條目的順序在 bundle 編譯時就已確定，不同執行之間不會改變。
-
-這是整個 pipeline 中唯一從構造上就完全確定性的階段。
-
-### 第二階段：`FX()` — allowedTools / denyRules 過濾
-
-`FX()` 取得內建陣列後，使用 `allowedTools` 和 `denyRules` 設定執行 `.filter()`。因為 `.filter()` 保留插入順序，存活下來的條目相對順序與第一階段相同。
-
-如果你傳入 `allowedTools: ["Bash", "Read", "Write"]`，結果列表會按照這些工具在第一階段的順序排列，而不是你指定的順序。`allowedTools` 陣列被當作成員檢測，不是排序指令。
-
-### 第三階段：`u66()` — 內建 + MCP 合併
-
-`u66()` 通過串接內建工具和 MCP 工具產生最終工具列表：
+合併步驟（source 中為 `u66`）將內建工具和 MCP 工具串接：
 
 ```javascript
+// 內建工具永遠在前，MCP 工具附加在後
 [...builtins, ...mcpTools]
 ```
 
-然後用 key 函數 `K0` 去重（基於 Map 的去重，保留第一次出現的）。結果是：內建工具永遠排在 MCP 工具前面，如果 MCP 工具與內建工具同名，內建工具優先。
+然後按名稱去重，保留第一次出現的。內建工具永遠排在 MCP 工具前面。如果 MCP 工具與內建工具同名，內建工具優先。
 
-### 第四階段：`mGq()` → `Sh1()` — 序列化
+### 第四階段：序列化為傳輸格式
 
-`Sh1()` 將每個工具轉換成 API wire format：
+序列化器（source 中為 `Sh1`）將每個工具轉換成 API 需要的格式：
 
 ```javascript
 {
   name: tool.name,
-  description: await A.prompt(),   // 非同步
-  input_schema: tool.inputJSONSchema ?? fU(tool.inputSchema)
+  description: await tool.prompt(),  // 非同步 — 這很重要
+  input_schema: tool.jsonSchema ?? deriveFromZod(tool.inputSchema)
 }
 ```
 
-這裡有兩個細節很重要：
+有兩個細節對快取穩定性很重要：
 
-**`description` 是非同步的。** 內建工具同步回傳靜態字串。MCP 工具可能呼叫 server 取得動態 description。server 回應中的任何非確定性都會直接傳播到序列化後的 payload。
+**Description 是非同步解析的。** 內建工具回傳靜態字串 — 永遠是同樣的內容。MCP 工具可能呼叫 server 取得動態 description。Server 回應中的任何非確定性都會直接傳播到序列化後的 payload。
 
-**schema 來源依工具類型不同。** MCP 工具使用 `inputJSONSchema`（MCP server 提供的 schema）。內建工具通過 `fU()` 從 Zod 定義推導其 schema，`fU()` 用 WeakMap 做記憶化——所以內建工具的 schema 在進程內是穩定的。
+**Schema 來源依工具類型不同。** MCP 工具使用 MCP server 在註冊時提供的 JSON schema。內建工具通過一個有記憶化的轉換器從 Zod 定義推導 schema — 在進程生命週期內穩定。
 
-在主要查詢路徑中，`cache_control` 不會應用於個別工具層級。工具不會被單獨快取；只有組合好的 system prompt 才會有快取標記。
-
----
-
-## 關鍵發現：整個工具路徑中沒有任何 `.sort()`
-
-在整個 `cli.js` 原始碼中搜尋工具相關代碼附近的 `.sort()` 呼叫。找到的每一個 `.sort()` 呼叫都屬於以下類別之一：
-
-- Worktree 路徑排序
-- Insights 資料排序
-- Help 選單顯示
-- Compact metadata 輸出
-
-在 `ng()`、`FX()`、`u66()`、`mGq()` 或 `Sh1()` 中沒有任何 `.sort()`。
-
-**工具順序在所有四個階段都嚴格依插入順序。** 這有一個具體後果：如果 MCP 工具的插入順序在兩次執行之間不同，序列化後的 `tools` 陣列就不同，prompt cache 就會 miss。
+`cache_control` 標記不會在個別工具層級套用。工具不會被單獨快取；只有組裝好的 system prompt 才會有快取標記。
 
 ---
 
-## MCP 工具排序：理論上穩定，實際上脆弱
+## 關鍵發現：整個路徑都沒有排序
 
-MCP 工具通過 `Fr6()` 進入 pipeline，它使用並行 server 初始化（`ZL1`）從所有已登錄的 MCP server 載入工具。載入是並行的——server 回應的到達順序是非確定性的。
+我在整個 `cli.js` source 中搜尋工具相關程式碼附近的 `.sort()` 呼叫。找到的每一個 `.sort()` 都屬於不相關的功能 — worktree 路徑排序、insights 資料、help 選單顯示、compact metadata 輸出。
 
-session 中儲存的工具列表是在啟動時從 client 登錄順序建構的。設定檔的順序決定登錄順序。對於從磁碟讀取的穩定設定檔，登錄順序在重啟之間是一致的。對於程式化構建的設定（例如通過 SDK options 注入），插入順序取決於呼叫方。
+工具 pipeline 在任何階段都沒有 `.sort()`。工具順序從頭到尾嚴格依照插入順序。
 
-實際上，MCP 工具順序通常是穩定的。脆弱性出現在兩種場景：
-
-1. **程式化設定構建**，其中工具順序沒有被明確控制（例如，對一個 key 順序不確定的物件進行迭代）。
-2. **MCP server 重新連接事件**，server 斷線後恢復。重新連接時，工具列表重新登錄，可能在合併後的陣列中出現在不同位置。
-
-這兩種場景都會產生結構上不同的 `tools` 陣列。Anthropic API 將整個 `tools` 區塊視為快取前綴的一部分。不同的陣列 = 不同的前綴 = 完整的快取 miss。
+這意味著快取前綴取決於一個沒有人明確控制的東西。對內建工具來說沒問題 — 編譯時陣列每次執行都一樣。對 MCP 工具來說，這表示順序取決於工具是如何、何時被註冊的，而這就是脆弱之處。
 
 ---
 
-## 延遲工具載入：對話中途的快取破壞者
+## MCP 工具排序：通常穩定，偶爾不是
 
-這是最有影響力的發現。
+MCP 工具通過載入器（source 中為 `Fr6`）進入 pipeline，它會並行初始化所有已註冊的 MCP server。回應以非確定性的順序抵達 — 但 session 中儲存的工具列表是依啟動時的 client 註冊順序建構的，而非回應抵達順序。所以對於從磁碟讀取的設定檔，註冊順序在重啟之間是一致的。
 
-`GX()` 實現了延遲工具載入。規則很簡單：每個 `isMcp === true` 的工具預設都是延遲的。
+脆弱性出現在兩種場景：
 
-「延遲」在實際中的含義：
+**程式化設定建構。** 如果你的程式碼是透過迭代一個 key 順序不保證的資料結構來建構 `mcpServers` 物件，註冊順序在不同執行之間就會變化。兩個名義上相同但 key 插入順序不同的設定，會產生不同的 MCP 工具陣列。
 
-- 工具的完整 schema **不會** 在初始 API 請求中發送
-- 相反，只有工具名稱被列在 system prompt 中的 `<available-deferred-tools>` 區塊裡
-- system prompt 看起來像：`<available-deferred-tools>mcp__server__toolname, ...</available-deferred-tools>`
+**MCP server 重新連線。** 如果 server 斷線後恢復，工具列表會重新註冊，可能在合併後的陣列中出現在不同位置。
 
-當 Claude 判斷它需要一個延遲工具時，會執行一個工具搜尋步驟來載入完整 schema。此時 `tools` 陣列獲得一個帶有完整 `{name, description, input_schema}` 物件的新條目。
-
-**這意味著在對話中首次調用任何 MCP 工具，對那次對話輪次來說是一個確定性的快取 miss。** 呼叫前的 `tools` 陣列與呼叫後的結構不同。快取前綴已經改變。
-
-在多輪 session 中：
-
-| 對話輪次 | 使用的 MCP 工具 | tools 陣列狀態 | 快取結果 |
-|---------|---------------|---------------|---------|
-| 1 | 無 | 僅延遲條目 | hit（如果穩定）|
-| 2 | `mcp__files__read`（首次使用）| 新增 1 個完整 schema 條目 | **miss** |
-| 3 | `mcp__files__read`（已快取）| 與第 2 輪相同 | hit |
-| 4 | `mcp__search__query`（首次使用）| 再新增 1 個完整 schema 條目 | **miss** |
-| 5+ | 相同工具 | 穩定 | hit |
-
-session 中每個首次被調用的 MCP 工具都會花費一次快取 miss。你使用的不同 MCP 工具越多，session 在工具陣列穩定之前積累的確定性 miss 就越多。
-
-Feature flag `tengu_defer_all` 將延遲擴展到所有工具，包括內建工具。啟用時，初始工具陣列幾乎是空的，每次工具使用都會觸發延遲載入。這個 flag 似乎用於特定的內部場景。
+兩種場景都會產生結構上不同的 `tools` 陣列。Anthropic API 將整個 `tools` 區塊視為快取前綴的一部分。不同的陣列 = 不同的前綴 = 完整的快取 miss。
 
 ---
 
-## `disallowedTools` 過濾：`_c()` 保留順序
+## 延遲工具載入：隱藏的快取破壞者
 
-`_c()` 將 `disallowedTools` 設定物化為 Set，然後應用 `.filter()` 移除匹配的條目。順序被保留。過濾在 agent 或 subagent 層級應用，來源於 agent 定義的 frontmatter。
+這是整份報告中影響最大的發現。
 
-從 SDK 側，`disallowedTools` 作為 `--disallowedTools ToolA,ToolB` CLI 參數傳遞。這個階段也沒有應用任何排序。
+Claude Code 預設會延遲所有 MCP 工具。延遲載入控制器（source 中為 `GX`）的規則很簡單：每個 `isMcp === true` 的工具都會被延遲。實際上是這樣運作的：
 
----
+Session 開始時，MCP 工具根本不會被包含在 `tools` 陣列中。取而代之的是，只有它們的名稱被列在 system prompt 中的一個文字區塊裡：`<available-deferred-tools>mcp__server__toolname, ...</available-deferred-tools>`。模型能看到名稱、知道可以要求使用這些工具，但完整 schema 不在請求中。
 
-## 完整快取影響分析
+當 Claude 決定它需要一個延遲工具時，會執行一個搜尋步驟來載入完整 schema。此時 `tools` 陣列獲得一個帶有完整 `{name, description, input_schema}` 物件的新條目。
 
-按可能性和嚴重性排序：
+**在對話中首次調用任何 MCP 工具，都是一次保證的快取 miss。** 呼叫前的 `tools` 陣列與呼叫後結構不同。快取前綴已經改變。這是繞不過去的。
 
-### 高影響：延遲工具載入（每個 session 首次 MCP 使用）
+一個多輪 session 看起來是這樣：
 
-在 MCP 工具首次載入的那輪對話，確定性地快取 miss。影響所有使用 MCP 工具的 session。miss 是結構性的——延遲載入前後的 `tools` 陣列字面上就是不同的。
+| 輪次 | 發生了什麼 | tools 陣列 | 快取 |
+|-----|----------|-----------|-----|
+| 1 | 沒使用 MCP 工具 | 只有延遲名稱 | Hit（如果前綴穩定）|
+| 2 | 首次使用 `mcp__files__read` | 新增 1 個完整 schema | **Miss** |
+| 3 | 再次使用 `mcp__files__read` | 與第 2 輪相同 | Hit |
+| 4 | 首次使用 `mcp__search__query` | 再新增 1 個完整 schema | **Miss** |
+| 5+ | 重複使用相同工具 | 穩定 | Hit |
 
-### 高影響：動態 MCP 工具 description
+每個首次被調用的 MCP 工具都會花費一次保證的快取 miss。Session 使用的不同 MCP 工具越多，在工具陣列穩定之前累積的 miss 就越多。
 
-如果 MCP server 的工具 description 是動態生成的（例如，包含時間戳、資料庫記錄計數或任何運行時狀態），序列化後的 description 在對話輪次之間會改變。即使任何工具 description 中有一個字元的差異，也會讓整個 `tools` 區塊失效。
-
-`Sh1()` 中的 `description` 欄位來自 `await A.prompt()`。對於 MCP 工具，這從 server 解析。如果 server 回傳任何變化的內容，快取就會中斷。
-
-### 中等影響：MCP server 設定排序
-
-如果 `mcpServers` 以 JavaScript 物件傳遞（在 SDK 使用中很常見），key 迭代順序取決於插入順序，這在所有環境和版本中不保證是一致的。兩個名義上相同但 key 插入順序不同的設定，會產生不同的 MCP 工具陣列。
-
-### 中等影響：`extraToolSchemas` 變化
-
-某些功能只在啟用時才向陣列注入額外的工具 schema。Web search 是一個例子：它的 schema 只在那輪對話中 web search 功能啟用時才出現在 tools 陣列中。在對話中途切換功能會改變 tools 陣列結構。
-
-### 低影響：`isEnabled()` 狀態變化
-
-每個工具都有一個 `isEnabled()` 斷言。如果 MCP server 連接中斷，MCP 工具可能變為停用。重新連接時改變了哪些工具是 `isEnabled()` 的狀態，會改變過濾後的工具列表。在穩定設置中很少見，但值得注意。
-
-### 無影響：內建工具 description
-
-內建工具從 `A.prompt()` 回傳靜態字串。這些字串在實際中不是非同步的，也不會在執行之間變化。從快取角度來看，內建工具 description 是安全的。
-
-### 無影響：內建工具 schema
-
-內建工具 schema 通過 `fU()` 從 Zod 定義推導，在進程生命週期內通過 WeakMap 記憶化。它們在對話輪次之間不會改變，是安全的。
+還有一個 feature flag（source 中為 `tengu_defer_all`）會將延遲擴展到所有工具，包括內建工具。啟用時，初始工具陣列幾乎是空的，每次工具使用都會觸發延遲載入。這似乎用於特定的內部場景。
 
 ---
 
-## 緩解策略
+## 工具 Description：內建安全，MCP 危險
 
-### 1. 在傳遞給 SDK 之前對 `allowedTools` 排序
+序列化器透過呼叫一個非同步方法來解析每個工具的 description。對內建工具來說，這會回傳一個靜態字串 — 硬編碼在 bundle 中，每次都一樣。內建 description 對快取是安全的。
+
+對 MCP 工具來說，description 來自 MCP server。如果 server 動態生成 description — 包含時間戳、記錄數量、環境變數、任何在不同呼叫之間會變化的東西 — 序列化後的 description 在不同輪次之間就會改變。即使任何工具 description 中有一個字元的差異，也會讓整個 `tools` 區塊在快取前綴中失效。
+
+這特別隱蔽，因為工具本身可能運作完全相同。搜尋結果一樣、行為一樣，但 description 說「在 1,847 個文件中搜尋」而不是「在 1,846 個文件中搜尋」，整個快取就沒了。
+
+---
+
+## disallowedTools 和 allowedTools：保留順序的過濾器
+
+禁用工具過濾器（source 中為 `_c`）將 `disallowedTools` 設定物化為 Set，然後用 `.filter()` 移除匹配的條目。順序被保留。過濾在 agent 或 subagent 層級套用，來源於 agent 定義的 frontmatter。
+
+從 SDK 側，`disallowedTools` 以 `--disallowedTools ToolA,ToolB` CLI 參數傳遞。這個階段也沒有任何排序。
+
+`allowedTools` 和 `disallowedTools` 本身都不會引入排序不穩定性 — 它們保留過濾前的既有順序。風險只在於這些過濾器的輸入本身就不穩定的情況。
+
+---
+
+## SDK 使用者能做什麼
+
+### 在傳遞給 SDK 之前排序 `allowedTools`
 
 ```javascript
-// 之前（不穩定——取決於物件插入順序）
-const options = {
-  allowedTools: getEnabledTools()
-};
+// 不穩定 — 取決於 getEnabledTools() 怎麼建構列表
+const options = { allowedTools: getEnabledTools() };
 
-// 之後（穩定——字母順序）
-const options = {
-  allowedTools: getEnabledTools().sort()
-};
+// 穩定 — 字母順序，永遠一致
+const options = { allowedTools: getEnabledTools().sort() };
 ```
 
-一行代碼。消除一個排序不穩定的來源。
+一行程式碼。消除一個排序不穩定的來源。
 
-### 2. 對 `mcpServers` 的 key 排序以獲得穩定的序列化
+### 排序 `mcpServers` 的 key
 
 ```javascript
-// 之前
-const mcpServers = buildMcpConfig();
-
-// 之後
+// 確保無論設定怎麼建構，key 順序都一致
 const mcpServers = Object.fromEntries(
   Object.entries(buildMcpConfig()).sort(([a], [b]) => a.localeCompare(b))
 );
 ```
 
-確保程式化構建的 MCP 設定，無論插入順序如何，都產生一致的 key 順序。
+### 讓 MCP 工具 description 完全靜態
 
-### 3. 讓 MCP 工具 description 完全靜態
-
-如果你控制 MCP server，確保其工具 description 是硬編碼的常數。`description` 欄位中不要有時間戳、資料庫查詢或任何環境相關的內容。
+如果你控制 MCP server，就把 description 硬編碼。不要有時間戳、資料庫查詢或任何執行時狀態。
 
 ```python
-# 不好：動態 description
+# 動態 description — 快取殺手
 @mcp.tool()
 def search(query: str) -> str:
     """在 {len(self.documents)} 個文件中搜尋。"""
     ...
 
-# 好：靜態 description
+# 靜態 description — 快取安全
 @mcp.tool()
 def search(query: str) -> str:
     """在文件索引中搜尋。"""
     ...
 ```
 
-### 4. 在 session 開始時預熱 MCP 工具
+### 在 session 開始時預熱 MCP 工具
 
-如果你知道一個 session 會使用哪些 MCP 工具，可以提前觸發它們，強制延遲載入在快取敏感的輪次之前發生。在 session 初始化時對每個工具做一次無操作調用，把確定性的 miss 放在前面而不是對話中途。
+如果你知道 session 會用到哪些 MCP 工具，提前觸發它們。在 session 初始化時用一個拋棄式 prompt 強制延遲載入，在快取敏感的輪次之前完成：
 
 ```javascript
-// Session 初始化
-await session.query("列出可用的 mcp 工具", { maxTurns: 1 });
-// 現在所有 MCP 工具都已載入；後續輪次可以快取
+// 強制所有 MCP 工具預先載入
+await session.query("list the available mcp tools", { maxTurns: 1 });
+// 後續輪次受益於穩定的 tools 陣列
 ```
 
-### 5. 考慮在快取關鍵 session 中停用延遲載入
+這樣做把保證的快取 miss 集中到 session 開頭，而不是散落在正式工作的輪次中。
 
-如果你的 session 使用已知的固定 MCP 工具集，停用延遲載入意味著所有 schema 都預先序列化。不會有來自新工具載入的對話中途快取破壞。這是一個取捨：初始請求更大，但從第一輪就有穩定的 `tools` 陣列。
+### 考慮完全停用延遲載入
 
-這需要打補丁或 flag——目前沒有直接停用延遲載入的公開 API 選項。
+如果你的 session 使用的是已知、固定的 MCP 工具集，停用延遲載入意味著所有 schema 都預先序列化。初始請求較大，但從第一輪起 `tools` 陣列就穩定。對話中途不會有意外。
 
-### 6. 監控跨對話輪次的 tools 陣列
+目前沒有公開的 API 選項可以做到這件事 — 需要打補丁或使用 feature flag。
 
-加入日誌記錄，捕獲 session 前幾輪的序列化 tools 陣列。如果你看到第 2、3、4 輪中出現新條目，那些就是導致快取 miss 的延遲載入。在決定緩解措施之前，先量化這個模式。
+### 監控跨輪次的 tools 陣列
+
+對 session 的前幾輪記錄序列化後的 tools 陣列。如果第 2、3、4 輪出現新條目，那些就是延遲載入造成的快取 miss。在決定緩解策略之前，先量化這個模式。
 
 ---
 
-## 對真實系統的影響
+## 真實世界的成本
 
-對於一個使用 3 個 MCP server（每個 4–6 個工具）的系統：
+使用 3 個 MCP server（每個 4-6 個工具）的系統：
 
-- **基準**：session 開始時 15–18 個延遲工具
-- **前 15–18 輪**：每個首次被調用的 MCP 工具至少有一次確定性 miss
-- **所有工具載入後**：`tools` 陣列穩定，快取可以累積
+- Session 開始時有 15-18 個延遲工具
+- 每個首次被調用的 MCP 工具都會觸發一次保證的快取 miss
+- 在所有需要的工具都至少被使用過一次之前，tools 陣列不會穩定
+- 如果平均 session 是 10 輪、你有 15 個 MCP 工具，session 可能在整個持續時間內都處於快取 miss 狀態
 
-如果你的平均 session 是 10 輪，你有 15 個 MCP 工具，每個 session 可能在整個持續時間內都處於快取 miss 狀態。
+只使用內建工具的系統：
 
-對於一個沒有 MCP 工具（只有內建工具）的系統：
-
-- 第一階段輸出是編譯時穩定的
-- 第二階段輸出如果 `allowedTools` 排序或省略就是穩定的
-- 沒有延遲載入
+- 工具列表是編譯時穩定的
+- 不會發生延遲載入
 - 從第一輪起快取穩定性幾乎是有保證的
+
+這兩種場景之間的差距，就是 MCP 工具整合中沒有人提到的隱形成本。
 
 ---
 
 ## 參考資料
 
-- [逆向工程 Claude Agent SDK：每條訊息消耗 2–3% Credit 的根本原因與修復](../agent-sdk-cache-invalidation/README.md) — 前置閱讀；涵蓋 prompt cache 的運作方式以及快取 miss 的代價
+- [逆向工程 Claude Agent SDK：每條訊息消耗 2-3% Credit 的根本原因與修復](../agent-sdk-cache-invalidation/README.md) — 涵蓋 prompt cache 的運作方式以及快取 miss 的代價
 - SDK 版本：`@anthropic-ai/claude-agent-sdk` v0.2.76，`cli.js` build `2026-03-14`
 - Anthropic API prompt caching：快取讀取費用為基礎 input 費用的 10%；快取寫入費用為 125%
-- [Model Context Protocol 規範](https://modelcontextprotocol.io) — `Sh1()` 中引用的 MCP 工具 schema 格式
+- [Model Context Protocol 規範](https://modelcontextprotocol.io)

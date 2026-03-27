@@ -1,397 +1,240 @@
-# Context Lifecycle Management — Claude Code 如何決定何時壓縮、保留什麼、代價是什麼
+# Context 生命週期管理 — Claude Code 如何決定何時壓縮、保留什麼、代價是什麼
 
-一段對話跑到一半，Claude Code 無聲地把它壓縮了。帳單上出現一個費用尖峰。下一輪慢了。如果你在跑自動化 agent loop，可能兩輪後又重演一次。
+長對話會成長。每次工具呼叫、每段程式碼、每個來回都往 context window 裡加 token。終究，對話必須縮小，否則它會撞上硬牆。
 
-這就是 autocompact。沒有文件說明它怎麼運作。這份報告對它進行逆向工程：什麼時候觸發、精確的觸發條件、什麼內容能存活下來、代價是多少——包括兩個據我們所知至今未被公開描述過的機制。
+Claude Code 有一套自動壓縮系統叫 autocompact。它沒有文件。它在你的 context 變太大時無聲啟動，把大部分對話替換成一份摘要，讓你繼續工作，像什麼都沒發生一樣。
+
+但事情確實發生了。Prompt cache 剛剛被摧毀。下一條訊息的成本是正常的 125%。而在某些條件下，壓縮本身還會觸發另一次壓縮，再次摧毀 cache。
+
+這份報告逆向工程了完整的生命週期：context 大小如何計算、五個控制決策的閾值、壓縮何時觸發、什麼能存活、以及兩個此前未被公開記錄的機制——它們如何在你不知情的情況下推高成本。
 
 分析版本：`@anthropic-ai/claude-agent-sdk` v0.2.76（cli.js build 2026-03-14）
 
 ---
 
-## 方法論
+## Context 大小如何計算
 
-所有發現都來自對 `cli.js` 的直接原始碼分析——這是 12MB 的 minified 引擎，同時支撐 Claude Code CLI 和 Agent SDK。變數名稱已被混淆成無意義的短識別碼；函式透過字串常數錨點定位。
+Claude Code 不假設固定的 context window。它在 runtime 根據模型計算有效容量。
 
-使用的主要錨點：
+第一步決定原始 window 大小。模型名稱含 `[1m]` 或啟用了 `1M` beta flag 的得到 1,000,000 tokens。Sonnet 4.6 加上 high-latency-allowance beta 也是 1,000,000。其他一律 200,000。
 
-- `"DISABLE_AUTO_COMPACT"` → 閾值邏輯與觸發閘門
-- `"session_memory"` → compaction 流程內部的遞迴防護
-- `"compact"` → compaction 期間使用的 query source 標籤
-- `"prompt_too_long"` → reactive compact 入口點
-- `"input length and max_tokens exceed context limit"` → context overflow 還原解析器
-- `"Today's date is"` → currentDate 注入位置
+接著扣除兩個預留量。一個是模型的最大輸出 token 數——Opus 4.6 是 64,000，Opus 4.5 和 Opus 4 是 32,000，Claude 3 Opus 是 4,096。另一個是固定的 20,000 token 緩衝區，不論模型都會從 window 中永久扣除。
 
-每個發現後面都附有對應的常數名稱或原始碼呼叫鏈。
+公式：
+
+```
+有效容量 = 原始 window - 最大輸出 tokens - 20,000
+```
+
+對標準 200k 模型（輸出上限 4,096 token），有效容量大約是 176,000 tokens。但這不是壓縮觸發的位置——上面還疊著額外的邊距。
 
 ---
 
-## 發現
+## 五個閾值，五種行為
 
-### 1. Context Window 大小是計算出來的，不是假設的
+Claude Code 每輪都拿當前 token 數對照五個閾值進行評估。這些全是硬編碼常數，沒有 UI、沒有設定檔、沒有 settings key。唯一的覆寫方式是環境變數。
 
-Claude Code 不假設固定的 context window。它在 runtime 根據模型逐一計算有效可用空間。
+**Autocompact 邊距**從有效容量再扣 13,000 tokens。這是自動壓縮的觸發點。在標準 200k 模型上，這代表壓縮在大約 163,000 tokens 時觸發——不是 200,000，不是 176,000，是 163,000。如果你按「接近上限時才壓縮」來規劃，你會差將近 40,000 tokens。
 
-**`uM(model, betas)`** 決定原始 context window：
+**Warning 閾值**在 autocompact 觸發點之外再加 20,000 token 邊距。Context 越過這條線時 UI 顯示黃色指示器。不採取任何動作。
 
-- 模型名稱包含 `[1m]` 或 `1M` beta feature flag → 1,000,000 tokens
-- `sonnet-4-6` + HLA（high-latency-allowance）beta → 1,000,000 tokens
-- 所有其他模型 → 200,000 tokens
+**Error 閾值**再加 20,000 token 邊距。UI 顯示紅色指示器。除了視覺提示外仍不採取動作。
 
-**`oa(model)`** 決定每個模型的最大輸出 tokens：
+**硬封鎖限制**距離絕對上限 3,000 tokens。到這個點 Claude Code 完全拒絕接受新訊息。Session 凍結，直到 context 被縮減。
 
-| 模型 | 最大輸出 |
+**Circuit breaker** 計算連續壓縮失敗的次數。連續 3 次後系統停止嘗試。這防止在壓縮無法將 context 降到閾值以下時形成無限迴圈。
+
+五個閾值在每輪中以一次 pass 全部評估完。函式回傳一個狀態結構，系統其餘部分讀取它來決定下一步行動。
+
+---
+
+## 決策鏈：Autocompact 何時觸發
+
+在檢查 context 是否太大之前，系統先通過一系列閘門。
+
+首先是三個環境開關。`DISABLE_COMPACT` 設定了的話，所有壓縮都關掉——主動和被動都是。`DISABLE_AUTO_COMPACT` 設定了的話，只封鎖主動路徑；緊急路徑仍然有效。使用者設定中 `autoCompactEnabled` 設為 false，效果等同第二個開關。任何一個生效就代表系統完全跳過閾值檢查。
+
+其次是遞迴防護。壓縮本身是用 LLM 呼叫實作的——它把整段對話送給 Claude 要求摘要。這代表壓縮本身也會增加 context。沒有保護的話，一個較大的摘要就可能觸發另一次壓縮，產生另一份摘要，又觸發下一次。防護機制檢查當前 query 的來源：如果已經是壓縮呼叫，或是 session memory 更新，就跳過閾值檢查。
+
+只有所有閘門都通過之後，系統才拿當前 token 數和 autocompact 閾值比較。超過了，壓縮開始。
+
+---
+
+## 壓縮過程中發生什麼
+
+閘門全部通過且超過閾值後，壓縮執行器啟動。以下是從頭到尾的完整過程。
+
+它先記錄當前 token 數——在任何狀態變更前拍一張快照。然後執行已註冊的 pre-compact hooks。這是擴充點：如果任何 hook 以 exit code 2 退出，整個壓縮被取消。這是唯一的外部否決機制。
+
+接著清空檔案追蹤表。這張表記錄 Claude 在 session 期間讀過或寫過哪些檔案，用來偵測過時內容。清空它會強制下一輪重新建立，防止陳舊的檔案 diff 在壓縮後的 context 中累積。
+
+然後重建 memory 檔案和工具定義附件——確保新 context 有最新的專案狀態參考。
+
+壓縮的核心是建構摘要 prompt。系統建立一個 10 段式請求，要求 LLM 提取並保留：
+
+1. 環境設定 — OS、shell、工具版本
+2. 實際完成的變更 — 具體建立、修改、刪除的檔案
+3. 讀取過的檔案與程式碼段落 — 檢視了什麼、為什麼重要
+4. 問題解決歷程 — 遇到的錯誤、嘗試的假設、找到的解法
+5. 待辦工作與阻塞點 — 尚未完成的任務
+6. 使用者決策與偏好 — session 期間做出的明確選擇
+7. 專案背景與限制條件
+8. 當前工作狀態（標記為最重要的段落）
+9. 選擇性或低優先度項目 — 提到但未開始的
+10. 關鍵產出物 — 需要逐字保留的程式碼塊、設定、檔案內容
+
+這份 prompt 以 `maxTurns: 1` 發送為一次真實 API 呼叫。LLM 以兩個 XML 區段回應：`<analysis>` 區塊用於私有推理（丟棄），`<summary>` 區塊成為新的對話種子。
+
+Summary 回傳後，系統從 API 回應的 usage 欄位測量實際的壓縮後 token 數——不是估算，是真實數字。它也計算一個字元長度估算值供 UI 顯示。最後執行已註冊的 post-compact hooks，流程完成。
+
+舊的對話歷史消失了。取而代之的是：一份摘要，加上一段保留的最近訊息。
+
+---
+
+## 什麼能存活
+
+壓縮不會取代整段歷史。最近的訊息會被原樣保留，接在摘要後面。
+
+保留邏輯從最後一條訊息往回掃描，一邊走一邊累計 token 數。停止條件是：累積到 40,000 tokens，或者至少 10,000 tokens 且至少 5 條 text-block 訊息——看哪個先到。這個範圍內的所有內容原樣保留。
+
+有一個完整性檢查：如果一個 tool call 被保留，對應的 tool result 也必須保留，反之亦然。不允許出現孤立的工具呼叫配對。這防止壓縮後的 context 出現有工具呼叫卻沒有輸出的情況，那會讓模型困惑。
+
+最終結果是一段新對話：LLM 生成的摘要在最前面，然後是 10,000 到 40,000 tokens 的最近原始交談完整保留在最後面。保留參數是硬編碼的——沒有辦法透過設定來擴大或縮小這個保留窗口。
+
+---
+
+## 原創發現：每天無聲發生的 Cache 全面失效
+
+我們發現一個 10 token 的日期字串每天都在無聲地讓數千 token 的 cached context 失效。原因如下。
+
+每一輪，Claude Code 注入一個 `<system-reminder>` 區塊，包含當前日期：
+
+```
+Today's date is 2026-03-27
+```
+
+日期注入本身不奇怪——模型需要知道日期。問題在於這個注入在訊息組裝中的位置。
+
+日期字串被串接到和 CLAUDE.md 內容、git status、以及其他很少變動的 context 相同的文字區塊中。這些全部合併成一個序列化單元後才送到 API。
+
+Prompt caching 基於嚴格的前綴匹配。Cache key 是整個前綴直到每個 cached 區塊為止的位元組序列。當日期在午夜改變時，這個合併區塊的序列化內容就改變了。因為日期在字串中出現在靜態 CLAUDE.md 內容之前，它之後的每個位元組在前綴中都移位了。
+
+後果：每天午夜，這個注入點之後的所有 cached context 全部失效。當天第一個 session 以 `cache_write` 費率——基礎成本的 125%——支付整段對話歷史的完整 token 數。數千 token 完全沒有變化的內容被重寫，只因為一個 10 字元的日期字串移動了前綴邊界。
+
+這不是使用者程式碼的 bug。這是注入區塊組裝方式的結構性後果——日期被嵌入在和靜態內容相同的序列化單元中，而不是放在獨立區塊裡。據我們所知，這個機制此前未被公開描述過。
+
+對大多數互動式使用者來說，這不可見——session 很少跨越午夜。但跑整夜任務的自動化 agent 每 24 小時都要付這筆費用，而且它隨對話長度成比例增長。
+
+---
+
+## 原創發現：壓縮連鎖反應
+
+壓縮的目的是透過縮小 context 來節省成本。但在某些條件下，它觸發了一個讓成本倍增的連鎖反應。
+
+以下是它的運作方式。
+
+壓縮期間，系統正確地設定了一個 flag 來跳過寫入新的 cache 斷點——摘要是暫時性的，不應該建立新的 cache。壓縮完成後，session 狀態被重置。這使 session 期間累積的所有現有 prompt cache 斷點全部失效。
+
+因此壓縮後的第一輪行為就像全新 session 的第一輪：每個 token 以 `cache_write` 費率（125%）傳送，從零建立一個新的 cache 斷點。
+
+現在關鍵問題來了：如果壓縮後的摘要仍然太大呢？
+
+壓縮後，系統用壓縮後 token 數對照閾值進行評估。如果仍然超過 autocompact 觸發點，它就標記下一輪會再次觸發壓縮。當使用者送出下一條訊息時，閾值檢查再次啟動。第二次壓縮執行。Session 狀態再次重置。又一次完整的 cache 重建隨之而來。
+
+連鎖反應的每個環節造成三重成本：一次完整的 LLM 壓縮呼叫（把整段 context 送去摘要的 API 費用）、一次以 125% 寫入費率對所有 token 的完整 cache 重建、以及觸發下一個環節的可能性。
+
+連鎖反應在兩種情況下停止：token 數終於降到閾值以下，或者 circuit breaker 在連續 3 次失敗後跳閘。
+
+這個情境只在 context 真的非常龐大時才會發生——1M token 的 session 中，即使摘要形式也超過 autocompact 閾值。在互動式使用中，這很罕見。但在跑長時間多小時任務的自動化 agent loop 中，這是一個實際的失敗模式。一次 2-3 環的連鎖反應可能花費相當於 10-15 次正常對話輪次的成本。
+
+---
+
+## 緊急路徑：Reactive 壓縮
+
+Autocompact 是主動的——它在 API 呼叫前根據 token 估算觸發。但估算可能不準。
+
+如果系統低估了 context 大小，送出的請求太大，Anthropic API 回傳 `prompt_too_long` 錯誤。這時 reactive 壓縮啟動。
+
+它執行和 autocompact 相同的壓縮流程，但有一個重要差異：你已經為那個失敗的 API 呼叫付過錢了。Tokens 已經送出、處理、以 `cache_write` 費率計費，然後才被拒絕。Reactive 壓縮再跑一次 API 呼叫。所以你付了兩次——一次是被拒的請求，一次是壓縮本身。
+
+有一個安全限制：reactive 壓縮每輪最多嘗試一次。如果嘗試本身失敗，系統放棄並浮現錯誤。
+
+---
+
+## 自動輸出縮減
+
+與壓縮分開，Claude Code 在 API 層級處理另一種溢出情境：當 input token 數加上請求的 output token 數超過 context 上限。
+
+當這種情況發生時，系統解析錯誤訊息來提取實際數字——input 長度、請求的 output、context 上限。然後計算一個縮減後的 output 配額：
+
+```
+縮減後 output = context 上限 - input 長度 - 1,000
+```
+
+1,000 token 的邊距是硬編碼的。下限是 3,000 tokens——它不會把 output 配額降到這以下，以確保模型仍能產生有意義的回應。
+
+請求以縮減後的值自動重試。不需要使用者介入，不顯示錯誤。模型只是產出比原本更短的回應。
+
+---
+
+## 你可以調整什麼
+
+Claude Code 開放七個影響 context 生命週期行為的環境變數：
+
+| 變數 | 作用 |
 |---|---|
-| claude-opus-4-6 | 64,000 |
-| claude-opus-4-5 | 32,000 |
-| claude-opus-4 | 32,000 |
-| claude-3-opus | 4,096 |
-| 其他 | 不等 |
+| `DISABLE_COMPACT` | 關掉所有壓縮。如果 context 真的超過 window，session 會卡在 API 錯誤。只在你從外部管理 context 時使用。 |
+| `DISABLE_AUTO_COMPACT` | 只關掉主動壓縮。緊急路徑仍有效，但觸發時你付雙倍。 |
+| `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` | 以 context window 的百分比設定壓縮觸發點。`70` 代表在 70% 容量時壓縮——留出空間來避免連鎖反應。 |
+| `CLAUDE_CODE_AUTO_COMPACT_WINDOW` | 覆寫閾值計算中使用的 context window 大小。 |
+| `CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE` | 覆寫硬封鎖邊距（預設 3,000 tokens）。 |
+| `CLAUDE_CODE_DISABLE_1M_CONTEXT` | 即使模型符合 1M 資格也強制使用 200k window。適合成本控制。 |
+| `ENABLE_CLAUDE_CODE_SM_COMPACT` | 啟用基於 session memory 的替代壓縮路徑。預設停用。 |
 
-**`OF(model)`** 計算有效可用 window：
-
-```
-effectiveWindow = contextWindow - maxOutputTokens - RmY(20,000)
-```
-
-`RmY` 這個 20,000 token 常數是一個永久預留量，從所有 window 大小計算中扣除。這意味著一個 200k window 的模型，在任何閾值生效之前，input 的實際上限約為 164,000 tokens。
+對成本控制最有用的是 `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`。設成 60-70% 代表壓縮在 context 較小時就觸發，產生較小的摘要，使摘要不太可能仍超過閾值。這是防止連鎖反應最簡單的方法。
 
 ---
 
-### 2. 五個硬編碼閾值常數控制所有決策
+## 完整費用全貌
 
-```
-RmY = 20,000   最大輸出 tokens 預留（從每個 window 中扣除）
-Jp8 = 13,000   autocompact 安全邊距
-hmY = 20,000   warning 閾值邊距
-SmY = 20,000   error 閾值邊距
-Mp8 = 3,000    硬封鎖限制邊距
-aqq = 3        circuit breaker：最大連續 compaction 失敗次數
-```
+單次壓縮事件不只是一次 API 呼叫。以下是你的帳單上實際發生的事：
 
-這些全部硬編碼在 minified 原始碼中。沒有設定檔、沒有 settings key、沒有 UI 控制介面。唯一的 override 方式是環境變數（見第 13 節）。
-
-**`mz6(tokens, model)`** 在一次 pass 中評估所有閾值並回傳狀態結構：
-
-- `isAboveAutoCompactThreshold` — 觸發 soft compaction
-- `isAtWarningLevel` — 僅供 UI 指示器使用
-- `isAtErrorLevel` — 僅供 UI 指示器使用
-- `isAtBlockingLimit` — 硬停止，不接受新訊息
-
-**`oc6(model)`** 推導 autocompact 觸發點：
-
-```
-autocompactThreshold = OF(model) - Jp8(13,000)
-```
-
-對於標準 200k 模型：`(200,000 - 4,096 - 20,000) - 13,000 = 162,904 tokens`。
-
----
-
-### 3. 閘門前面還有閘門
-
-在 autocompact 檢查 token 數量之前，三個獨立的開關必須全部通過。
-
-**`Xh()`** 檢查：
-
-1. `DISABLE_COMPACT` 環境變數未設定
-2. `DISABLE_AUTO_COMPACT` 環境變數未設定
-3. `settings.autoCompactEnabled` 不是 false
-
-只要三者之一生效，當輪就完全跳過 autocompact。
-
-**`CmY()`** 是在執行 compaction 前立即執行的前置防護：
-
-- 如果 `querySource` 是 `"session_memory"` → 跳過（session memory 更新會產生遞迴）
-- 如果 `querySource` 是 `"compact"` → 跳過（已在 compaction 中，會形成無限迴圈）
-
-這是遞迴防護。Compaction 本身是以 `querySource: "compact"` 的 LLM 呼叫實作的。沒有這個檢查，一個較大的 compaction summary 就可能觸發另一次 compaction。
-
----
-
-### 4. 十步 Compaction 流程
-
-當所有閘門都通過且 token 數超過閾值，**`mf6()`** 開始執行。步驟依序如下：
-
-1. 透過 `eW(messages)` 記錄 `preCompactTokenCount` — 在狀態變更前捕捉 token 計數
-2. 執行 PreCompact hooks — 如果任何 hook 以 exit code 2 退出，compaction 整個取消
-3. 清除 `readFileState` cache — 檔案追蹤表被清空（強制下一輪重新建立）
-4. 重建 memory 檔案和 tool definition 附件
-5. 使用 `C54(customInstructions)` 建立 10 段式 summary prompt
-6. 以 `querySource: "compact"` 和 `maxTurns: 1` 呼叫 `Gqq()` — 實際的 LLM 摘要呼叫
-7. 用 `sF6(summary)` 建構一個接續起始訊息作為新對話開頭
-8. 透過 `Ck()` 測量 `postCompactTokenCount` — 從 API 回應的 usage 欄位讀取真實 token 數
-9. 透過 `GF6()` 估算 `truePostCompactTokenCount` — 供 UI 顯示用的字元長度估算
-10. 執行 PostCompact hooks
-
-Compaction 呼叫本身是一次真實的 API 呼叫。它消耗 tokens。它產生的 summary 取代之前的所有內容。
-
----
-
-### 5. Summary Prompt 要求什麼
-
-Compaction 期間傳給 LLM 的 10 段式 prompt：
-
-1. **環境/設定** — OS、shell、工具版本
-2. **實際完成的變更** — 具體建立、修改、刪除的檔案
-3. **檔案與程式碼段落** — 讀了什麼、為什麼重要
-4. **問題解決** — 遇到的錯誤、嘗試過的假設、找到的解法
-5. **待辦工作/下一步** — 未完成的任務、阻塞點
-6. **使用者決策與偏好** — session 期間做出的明確選擇
-7. **背景/環境** — 專案結構、限制條件
-8. **當前工作**（標記為最重要）— 現在工作的精確狀態
-9. **選擇性工作** — 提到但尚未開始的低優先度項目
-10. **關鍵產出物** — 需要逐字保留的重要程式碼塊、設定、檔案內容
-
-LLM 回應格式使用兩個 XML 標籤：
-
-- `<analysis>` — 不包含在輸出中的私有推理（chain-of-thought）
-- `<summary>` — 實際的壓縮 context，作為新對話種子使用
-
----
-
-### 6. 什麼能存活：保留區段
-
-Compaction 不會取代整個對話歷史。最近的訊息會被原樣保留並附加在 summary 之後。
-
-**`dE1`** 定義保留參數：
-
-```javascript
-dE1 = { minTokens: 10000, minTextBlockMessages: 5, maxTokens: 40000 }
-```
-
-**`EmY(messages, lastIdx)`** 從最新訊息往回掃描：
-
-- 往回累計 tokens
-- 停止條件：`tokens >= 40,000` 或 (`tokens >= 10,000` 且 `textBlockMessages >= 5`)
-- 符合條件範圍內的所有內容原樣保留
-
-**`Op8()`** 確保完整性：如果一個 `tool_use` 塊被保留，對應的 `tool_result` 塊也必須保留（反之亦然）。不允許出現孤立的 tool call 配對。
-
-最終結果是新的對話歷史：LLM 生成的 summary 在前，然後是 10k–40k tokens 的最新原始訊息完整保留。
-
----
-
-### 7. 原創發現：currentDate 的 Cache 殺傷問題
-
-每一輪，**`eE1()`** 注入一個 `<system-reminder>` 塊，包含：
-
-```
-Today's date is YYYY-MM-DD
-```
-
-這本身不奇怪。問題在於它被注入到*哪裡*。
-
-`currentDate` 字串被串接到**同一個文字塊**中，和以下內容放在一起：
-
-- `claudeMd`（CLAUDE.md 內容——靜態，很少變動）
-- `gitStatus`（每次 commit 後會變）
-- 其他靜態 context
-
-Prompt caching 是嚴格前綴匹配。Cache key 是整個前綴直到每個 cached 塊為止的位元組序列。當 `currentDate` 改變——每天午夜發生一次——這個合併文字塊的序列化結果就會改變。因為日期在字串中位於靜態內容之前，所有在這個位置之後的 prefix 中的每個位元組現在都在不同的偏移量上。
-
-結果：每天午夜，這個注入點之後的所有 cached context 全部失效。當天第一個 session 以 `cache_write` 費率（125% 基礎成本）支付整個對話歷史的完整 token 數。
-
-大約 10 個 token 的改變，造成數千個 token 的未變更靜態內容 cache miss。
-
-這不是使用者程式碼的 bug。這是 `eE1()` 組裝這個塊的方式所造成的結構性特性。據我們所知，這是第一次公開記錄這個機制。
-
----
-
-### 8. 原創發現：Compact 連鎖反應
-
-Compaction 以一種特定的方式與 prompt cache 互動，可能導致它在短時間內連續觸發兩次。
-
-**Compaction 期間：**
-
-`sqq()`（主要 compaction 執行器）在 compaction 呼叫上設定 `skipCacheWrite: true`。這是正確的——summary 是暫時性的，不應該建立新的 cache 斷點。
-
-**Compaction 之後：**
-
-`gl()` 重置 session 狀態。這使 session 期間累積的所有現有 prompt cache 斷點全部失效。下一輪從零 cached context 開始。
-
-因此 compaction 後的第一輪行為就像新 session 的第一輪：
-
-- 所有 tokens 以 `cache_write` 費率傳送（125%）
-- 寫入一個新的 cache 斷點
-
-**如果 summary 仍然很大：**
-
-`mz6()` 評估新的 `postCompactTokenCount`。如果它仍然超過 autocompact 閾值，`willRetriggerNextTurn = true`。在下一次使用者輪次，閾值檢查再次觸發。第二次 compaction 執行。`gl()` 再次重置狀態。另一次完整的 cache rebuild 隨之而來。
-
-這個連鎖反應的每個環節：
-
-1. 觸發一次完整的 LLM compaction 呼叫（API 費用）
-2. 從零重建 prompt cache（所有 tokens 的 125% 寫入費用）
-3. 可能觸發下一個環節
-
-連鎖反應在 token 計數終於降到閾值以下，或者 `aqq = 3` 連續失敗的 circuit breaker 跳閘時停止。
-
-這只在 context 確實非常大的情況下才可能發生——1M token session 中，即使壓縮後的形式也超過 200k 預設閾值。但在跑長時間任務的自動化 agent loop 中，這不是理論上的邊緣情況。
-
----
-
-### 9. Reactive Compact：緊急路徑
-
-Autocompact 是主動的——它在 API 呼叫前、當 token 估算超過閾值時觸發。
-
-Reactive compact 在 API 呼叫*失敗後*觸發。
-
-如果 Anthropic API 回傳 `prompt_too_long` 錯誤，**`Bi6.tryReactiveCompact()`** 被呼叫：
-
-- 每輪最多嘗試一次
-- 如果已經嘗試過且嘗試失敗 → 回傳 `{reason: "prompt_too_long"}` 並放棄
-- 執行相同的 `mf6()` 流程，但由 API 拒絕觸發而非閾值估算
-
-這個區別在費用上很重要：reactive compact 意味著在 compaction 開始前，你已經為那個失敗的 API 呼叫支付了完整的 `cache_write` 費率。
-
----
-
-### 10. Context Overflow 還原：自動降低 max_tokens
-
-與 compaction 分開，Claude Code 在 API 層級處理 `input + max_tokens > context limit` 的情況。
-
-**`$54()`** 解析錯誤訊息：
-
-```
-input length and max_tokens exceed context limit: X + Y > Z
-```
-
-它提取數字，計算降低後的 `max_tokens`：
-
-```
-reducedMaxTokens = contextLimit - inputLength - 1000
-```
-
-1000 token 的邊距是硬編碼的。下限是 **`fN8 = 3,000 tokens`**——它不會將 `max_tokens` 降低到 3,000 以下。
-
-請求以降低後的值自動重試。沒有使用者介入，沒有可見的錯誤。
-
----
-
-### 11. Microcompact：一個 Stub
-
-**`pg()`** 在主迴圈中、autocompact 執行前被呼叫：
-
-```
-microcompact → autocompact
-```
-
-`pg()` 的當前實作回傳原始訊息陣列不變。它是一個占位符。Claude Code 的未來版本可能實作部分 context 修剪（針對特定訊息類型或 tool output），在退回到基於摘要的完整 autocompact 之前執行。
-
----
-
-### 12. Token 估算：三種方法，一個真實
-
-**文字估算** — `j5(text, charsPerToken=4)`：
-
-```javascript
-Math.round(text.length / 4)
-```
-
-**JSON 估算** — 同一函式，`charsPerToken=2`：
-
-JSON 比散文更密集，所以除數減半。
-
-**真實 token 計數** — 來自 API 回應的 `usage` 欄位：
-
-```javascript
-fF6(usage): input + cache_creation + cache_read + output
-```
-
-`mz6()` 和閾值檢查在 API 呼叫前使用估算計數。`postCompactTokenCount` 和 circuit breaker 決策在呼叫後使用 API 回應的真實計數。兩者之間存在一致的差距——估算計數用來決定是否要 compact，真實計數用來決定是否成功。
-
----
-
-### 13. 環境變數控制（完整列表）
-
-| 變數 | 效果 |
+| 事件 | 費用影響 |
 |---|---|
-| `DISABLE_COMPACT` | 停用所有 compaction（autocompact 和 reactive） |
-| `DISABLE_AUTO_COMPACT` | 僅停用主動式 autocompact；reactive compact 仍然執行 |
-| `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` | 以 context window 的百分比設定閾值：`floor(contextWindow * N / 100)` |
-| `CLAUDE_CODE_AUTO_COMPACT_WINDOW` | Override 閾值計算中使用的 context window 大小 |
-| `CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE` | Override 硬封鎖限制邊距（`Mp8`） |
-| `CLAUDE_CODE_DISABLE_1M_CONTEXT` | 即使對 1M 合格的模型也強制使用 200k window |
-| `ENABLE_CLAUDE_CODE_SM_COMPACT` | 啟用基於 session-memory 的替代 compact 路徑（預設停用） |
+| 壓縮呼叫本身 | 完整 API 呼叫——整段對話送去摘要 |
+| 壓縮後第一輪 | 所有 tokens 以 125% `cache_write` 費率（cache 已被摧毀） |
+| 第二輪起 | Cache 正常重建，回到 `cache_read` 費率 |
+| 連鎖反應（N 個環節） | 以上的 N 倍，疊加計算 |
+| 午夜 cache 失效 | 一次完整 `cache_write` 重建，與總對話大小成比例 |
+
+對 160,000 token 的 session，一次壓縮加壓縮後的 cache 重建大約花費 5-8 次正常對話輪次的成本。2-3 環的連鎖反應使之加倍或三倍。
+
+實務建議：如果你在跑 agent loop，監控壓縮後 token 數。如果它仍高於觸發閾值，連鎖反應已經在進行中。降低你的 `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`、把任務拆成更小的 session，或者接受費用尖峰讓 circuit breaker 在 3 次迭代後停止它。
 
 ---
 
-## 影響
+## 原始碼位置
 
-### 費用模型
+所有發現來自 `@anthropic-ai/claude-agent-sdk` v0.2.76 的 `cli.js`。函式透過字串常數錨點定位——這些在版本間的 minification 中不會改變。
 
-一次標準 autocompact 事件的費用結構如下：
-
-| 事件 | 費用 |
+| 錨點字串 | 定位什麼 |
 |---|---|
-| Compaction LLM 呼叫 | 所有 input tokens 以 `cache_write` 費率的完整 API 呼叫 |
-| Compaction 後第一輪 | 所有 tokens 完整 `cache_write`（cache 尚不存在） |
-| 後續每輪 | Cache 正常重建——第二輪後 `cache_read` |
-| 連鎖反應（N 個環節） | N × （compaction 呼叫 + cache rebuild） |
-
-對於一個 160k token session，單次 compaction 加上一輪 post-compaction 可能相當於 5–8 次正常輪次的費用。
-
-### 對 Agent Loop 的操作影響
-
-跑長時間任務的自動化 agent loop 受影響最深：
-
-1. **閾值意外** — 13,000 token 的 `Jp8` 邊距意味著 compaction 在 window 真正滿之前 13k token 就觸發。預設「在 200k 時 compact」是錯的；實際上在約 163k 時 compact。
-
-2. **午夜失效** — 任何跨越午夜執行的 session，在下一輪都會因為 `currentDate` 注入機制而支付完整的 cache rebuild 費用。跑整夜任務的 agent 應將此計入費用預測。
-
-3. **連鎖反應風險** — 在工作集非常大的 1M context session 中，即使是壓縮後的 summary 也可能超過 200k 預設閾值。這觸發連鎖反應。監控 `willRetriggerNextTurn`（如果有揭露的話）或觀察連續兩次 compaction 事件是唯一的早期預警。
-
-4. **Reactive compact 雙重費用** — 如果主動式 autocompact 被停用但 context 增長很大，第一個 `prompt_too_long` 錯誤觸發 reactive compact。你為失敗的呼叫付了一次，然後又為 compaction 付了一次。
+| `"CLAUDE_CODE_DISABLE_1M_CONTEXT"` | 原始 context window 大小判定 |
+| `"isAboveAutoCompactThreshold"` | 閾值評估函式 |
+| `"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"` | Autocompact 觸發點推導 |
+| `"DISABLE_AUTO_COMPACT"` | 環境開關閘門 |
+| `"session_memory"` / `"compact"` | 遞迴防護 |
+| `"preCompactTokenCount"` | 主壓縮執行器 |
+| `"skipCacheWrite"` | 壓縮期間的 cache flag |
+| `"Today's date is"` | 日期注入位置 |
+| `"minTextBlockMessages"` | 保留參數 |
+| `"input length and max_tokens exceed context limit"` | 溢出還原解析器 |
+| `"prompt_too_long"` | Reactive 壓縮入口點 |
 
 ---
 
-## 緩解措施
+## 相關報告
 
-### 不要盲目停用 Compaction
-
-`DISABLE_COMPACT` 會停用 autocompact 和 reactive compact 兩者。如果 context 真的超過 window，session 會卡在 API 錯誤上。只有在你自己從外部管理 context 大小時，才使用 `DISABLE_AUTO_COMPACT`。
-
-### 使用 `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` 提早 Compact
-
-如果你想避免連鎖反應，在 window 較低百分比時 compact。範例：`CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=70` 在 context window 的 70% 時觸發 compaction，留出空間來吸收比預期更大的 summary。
-
-### 為午夜 Cache 失效做預算
-
-如果在跑整夜 agent，每個 session 每天預算一次完整的 cache rebuild。費用與午夜時的總對話 token 計數成正比。執行時間長到跨越多個午夜的 session 每次都要付這個費用。
-
-### 監控 `postCompactTokenCount` vs 閾值
-
-Compaction 後，將 post-compaction token 計數與 autocompact 閾值比較。如果仍然高於閾值，下一次使用者輪次就保證會發生連鎖反應。此時唯一的解法是降低 `max_tokens` 輸出限制、拆分任務，或手動再次 compact。
-
-### 保留區段不可設定
-
-`dE1` 中的 10k–40k 保留區段參數是硬編碼的。沒有辦法透過設定來擴大或縮小保留 window。必須在 compaction 後原樣存活的工作，應該盡量放到接近對話末尾的 tool result 或結構化輸出中，讓它落在保留 window 範圍內。
-
----
-
-## 參考資料
-
-### 原始碼位置（v0.2.76 cli.js）
-
-| Symbol | 錨點字串 |
-|---|---|
-| `uM(model, betas)` | `"CLAUDE_CODE_DISABLE_1M_CONTEXT"` |
-| `OF(model)` | context window 減去 `RmY` 和 `oa(model)` 呼叫 |
-| `mz6(tokens, model)` | `"isAboveAutoCompactThreshold"` |
-| `oc6(model)` | `"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"` |
-| `Xh()` | `"DISABLE_AUTO_COMPACT"` |
-| `CmY()` | `"session_memory"` 鄰近 `"compact"` 防護 |
-| `mf6()` | `"preCompactTokenCount"` |
-| `sqq()` | `"skipCacheWrite"` 鄰近 compact 邏輯 |
-| `eE1()` | `"Today's date is"` |
-| `dE1` | `"minTextBlockMessages"` |
-| `EmY()` | 保留掃描中的 `"minTokens"` |
-| `$54()` | `"input length and max_tokens exceed context limit"` |
-| `Bi6.tryReactiveCompact()` | `"prompt_too_long"` |
-| `pg()` | 出現在主迴圈中 autocompact 之前，回傳訊息不變 |
-
-### 本倉庫相關報告
-
-- [逆向工程 Claude Agent SDK：每條訊息 2–3% 額度消耗的根本原因與修復](../agent-sdk-cache-invalidation/README.md) — session 層級的 cache 失效機制
+- [逆向工程 Claude Agent SDK：每條訊息 2–3% 額度消耗的根本原因與修復](../agent-sdk-cache-invalidation/README.md) — 每次呼叫都 spawn 新 process 如何摧毀 prompt cache
 - [Prompt Cache 架構](../prompt-cache-architecture/) — cache 斷點如何放置與維護
 - [system-reminder 注入](../system-reminder-injection/) — 完整注入分類與 token 費用
