@@ -62,9 +62,8 @@ Problem-oriented investigations based on reverse engineering the minified `cli.j
 
 ## Resources
 
-- [Design Flaws & Improvements](./source-code-analysis/design-flaws-and-improvements.md) — 14 design issues causing unnecessary cost or poor UX
 - [CLI Reverse Engineering Guide](./research/cli-reverse-engineering-guide.md) — search patterns & function locators for minified cli.js
-- [Analysis Plan](./source-code-analysis/ANALYSIS-PLAN.md) — the execution plan used to produce the 75 source code analysis reports
+- [Analysis Plan](./source-code-analysis/ANALYSIS-PLAN.md) — methodology for the 10-phase source code analysis
 
 ## Source Code Archives
 
